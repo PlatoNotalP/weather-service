@@ -14,16 +14,67 @@ import (
 	"github.com/go-co-op/gocron/v2"
 )
 
-const httpPort = ":8080"
+const (
+	httpPort = ":8080"
+	city     = "vladivostok"
+)
 
-func initJobs(scheduler gocron.Scheduler) ([]gocron.Job, error) {
+type Reading struct {
+	Timestamp   time.Time
+	Temperature float64
+}
+
+type Storage struct {
+	data map[string][]Reading
+	mtx  sync.RWMutex
+}
+
+func initJobs(scheduler gocron.Scheduler, storage *Storage) ([]gocron.Job, error) {
+	httpClient := &http.Client{
+		Timeout: time.Second * 10,
+	}
+	geocodingClient := geocoding.NewClient(httpClient)
+	openMeteoClient := open_meteo.NewClient(httpClient)
+
 	j, err := scheduler.NewJob(
 		gocron.DurationJob(
 			10*time.Second,
 		),
 		gocron.NewTask(
 			func() {
-				log.Println("Hello")
+				respFromGeocoding, err := geocodingClient.GetCoordinates(city)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				respFromOpenMeteo, err := openMeteoClient.GetTemperature(
+					respFromGeocoding.Latitude,
+					respFromGeocoding.Longitude,
+				)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				timestamp, err := time.Parse("2006-01-02T15:04", respFromOpenMeteo.Current.Time)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+				storage.mtx.Lock()
+				defer storage.mtx.Unlock()
+
+				storage.data[city] = append(
+					storage.data[city],
+					Reading{
+						Timestamp: timestamp,
+						Temperature: respFromOpenMeteo.Current.Temperature,
+					},
+				)
+
+				log.Println("updated data for city:", city)
 			},
 		),
 	)
@@ -38,33 +89,26 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 
-	httpClient := &http.Client{
-		Timeout: time.Second * 10,
+	storage := &Storage{
+		data: make(map[string][]Reading),
 	}
-	geocodingClient := geocoding.NewClient(httpClient)
-	openMeteoClient := open_meteo.NewClient(httpClient)
 
 	r.Get("/city/{city}", func(w http.ResponseWriter, r *http.Request) {
-		city := chi.URLParam(r, "city")
+		cityName := chi.URLParam(r, "city")
 
-		log.Printf("Request for city: %s\n", city)
+		log.Printf("Request for city: %s\n", cityName)
 
-		respFromGeocoding, err := geocodingClient.GetCoordinates(city)
-		if err != nil {
-			log.Println(err)
+		storage.mtx.RLock()
+		defer storage.mtx.RUnlock()
+
+		reading, ok := storage.data[cityName]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("not found"))
 			return
 		}
 
-		respFromOpenMeteo, err := openMeteoClient.GetTemperature(
-			respFromGeocoding.Latitude,
-			respFromGeocoding.Longitude,
-		)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		raw, err := json.Marshal(respFromOpenMeteo)
+		raw, err := json.Marshal(reading)
 		if err != nil {
 			log.Println(err)
 			return
@@ -81,7 +125,7 @@ func main() {
 		panic(err)
 	}
 
-	jobs, err := initJobs(s)
+	jobs, err := initJobs(s, storage)
 	if err != nil {
 		panic(err)
 	}
